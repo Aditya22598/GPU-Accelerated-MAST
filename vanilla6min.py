@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+import os
+import gc
+import json
+import shutil
+import time
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import scvi
+import torch
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+# ============================================================================
+# Configuration 
+# ============================================================================
+MAX_EPOCHS = 80                
+BATCH_SIZE = 4096               
+LATENT_DIM = 16                 
+HIDDEN_UNITS = 128              
+HIDDEN_LAYERS = 1               
+DROPOUT_RATE = 0.1              
+USE_AMPMIXED16 = True
+CONVERT_TO_DENSE = True
+NUM_DL_WORKERS = min(4, os.cpu_count() or 1)
+MIN_CELLS_PER_GENE_FRAC = 0.10 
+
+DE_N_SAMPLES = 400               
+DE_ALL_STATS = False
+MC_N_SAMPLES = 128               
+
+# ============================================================================
+# Hardware configuration
+# ============================================================================
+GPU_AVAILABLE = torch.cuda.is_available()
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("medium")
+scvi.settings.dl_num_workers = NUM_DL_WORKERS
+scvi.settings.dl_persistent_workers = True
+scvi.settings.num_threads = NUM_DL_WORKERS
+
+print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Running on {'GPU' if GPU_AVAILABLE else 'CPU'}, AMP16={USE_AMPMIXED16}")
+
+# ============================================================================
+# Paths and constants
+# ============================================================================
+MASK = "cell_type"
+ANN_PATH_ALL = "/20TB-storage/aditya22598/zoo/adata_raw.h5ad"
+CELL_JSON = "/20TB-storage/aditya22598/zoo/cell_type_data.json"
+OUTPUT_DIR = "/20TB-storage/aditya22598/zoo/output_vanilla_balanced"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ============================================================================
+# Load AnnData
+# ============================================================================
+print(f"[{datetime.now():%H:%M:%S}] Loading AnnData...")
+adata_all = sc.read_h5ad(ANN_PATH_ALL)
+adata_all.var_names_make_unique()
+print(f"Loaded {adata_all.n_obs:,} cells × {adata_all.n_vars:,} genes")
+
+if CONVERT_TO_DENSE and not isinstance(adata_all.X, np.ndarray):
+    print("Converting to dense representation...")
+    adata_all.X = adata_all.X.toarray()
+
+# ============================================================================
+# Run DE per cell type & Log profiling info
+# ============================================================================
+def run_cell_type(ct: str):
+    start_time = time.time()
+    try:
+        print(f"\n[{datetime.now():%H:%M:%S}] Processing: {ct}")
+        out_dir = os.path.join(OUTPUT_DIR, ct)
+        shutil.rmtree(out_dir, ignore_errors=True)
+        os.makedirs(out_dir, exist_ok=True)
+        
+        adata = adata_all[adata_all.obs[MASK] == ct].copy()
+        n_cells = adata.n_obs
+        if n_cells < 20:
+            print(f"Skipped {ct}: too few cells ({n_cells})")
+            return ct, None, None
+
+        sc.pp.filter_genes(adata, min_cells=int(MIN_CELLS_PER_GENE_FRAC * n_cells))
+        adata.obs["ngeneson"] = (adata.obs["n_genes_by_counts"] - adata.obs["n_genes_by_counts"].mean()) / (adata.obs["n_genes_by_counts"].std() + 1e-8)
+
+        scvi.model.SCVI.setup_anndata(
+            adata,
+            batch_key="replicate" if "replicate" in adata.obs.columns else None,
+            labels_key="label",
+            continuous_covariate_keys=["ngeneson"]
+        )
+
+        model = scvi.model.SCVI(
+            adata,
+            n_latent=LATENT_DIM,
+            n_hidden=HIDDEN_UNITS,
+            n_layers=HIDDEN_LAYERS,
+            dropout_rate=DROPOUT_RATE
+        )
+
+        model.train(
+            max_epochs=MAX_EPOCHS,
+            early_stopping=True,
+            batch_size=BATCH_SIZE,
+            accelerator="gpu" if GPU_AVAILABLE else "cpu",
+            devices=1 if GPU_AVAILABLE else None,
+            precision="16-mixed" if (USE_AMPMIXED16 and GPU_AVAILABLE) else "32",
+            load_sparse_tensor=not CONVERT_TO_DENSE,
+        )
+
+        if GPU_AVAILABLE:
+            model.to_device("cuda:0")
+
+        norm = model.get_normalized_expression(
+            n_samples=MC_N_SAMPLES,
+            return_mean=True
+        )
+        adata.obsm["normalized"] = norm
+
+        de = model.differential_expression(
+            idx1=adata.obs["label"] == "ctrl",
+            idx2=adata.obs["label"] == "stim",
+            mode="vanilla",
+            batch_correction=True,
+            weights="uniform",
+            n_samples_overall=DE_N_SAMPLES,
+            all_stats=DE_ALL_STATS
+        )
+
+        df = de.reset_index().assign(cell_type=ct)
+        fea_path = os.path.join(out_dir, f"{ct}_de_ultrafast.feather")
+        df.to_feather(fea_path)
+        print(f"Saved results for {ct}: {df.shape[0]:,} genes")
+
+        elapsed = time.time() - start_time
+        return ct, elapsed, df.shape[0]
+
+    except Exception as e:
+        print(f"Error processing {ct}: {e}")
+        return ct, None, None
+
+    finally:
+        for var in ['adata', 'model', 'de', 'norm', 'df']:
+            if var in locals():
+                del locals()[var]
+        torch.cuda.empty_cache()
+        gc.collect()
+
+# ==========================================
+# Main loop with profiling and plotting
+# ==========================================
+with open(CELL_JSON) as f:
+    cell_types = json.load(f)
+
+records = []
+for ct in tqdm(cell_types, ncols=80):
+    cell_name, elapsed, n_genes = run_cell_type(ct)
+    if elapsed is not None and n_genes is not None:
+        records.append({"cell_type": cell_name, "seconds": elapsed, "num_genes": n_genes})
+
+df = pd.DataFrame(records).sort_values("seconds", ascending=False)
+csv_path = os.path.join(OUTPUT_DIR, "de_processing_times_and_genes.csv")
+df.to_csv(csv_path, index=False)
+print(f"Performance summary saved to {csv_path}")
+
+plt.figure(figsize=(14, 7))
+bars = plt.bar(df["cell_type"], df["seconds"], color="royalblue")
+plt.ylabel("Processing Time (seconds)")
+plt.xlabel("Cell Type")
+plt.title("scVI Vanilla-mode DE Processing Time per Cell Type")
+plt.xticks(rotation=45, ha='right')
+
+for bar, genes in zip(bars, df["num_genes"]):
+    plt.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f"{genes:,}",
+             ha='center', va='bottom', fontsize=9, color='black')
+
+plt.tight_layout()
+png_path = os.path.join(OUTPUT_DIR, "processing_time_vs_celltype.png")
+plt.savefig(png_path, dpi=150)
+plt.show()
+
+print(f"Plot saved at: {png_path}")
+print(f"[{datetime.now()}] Pipeline completed successfully")
